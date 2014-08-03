@@ -239,6 +239,8 @@ splitOne tran subset =
                               else Just [self_as, S.difference subset self_as]
             in fromMaybe [subset] (msum (map sp bs))
 
+---------------------------------------------------------------------------------
+
 matchChar :: Char -> CharSpec -> Bool
 matchChar c cs = case cs of
                      (C c') -> c == c'
@@ -259,7 +261,7 @@ matchLit c (NoneOf rgs) = not $ any (matchRange c) rgs
 match :: Dfa -> String -> Either String String
 match (Dfa stSt deadSt acSts tran) s = match' stSt s ""
     where match' st buf cur
-            | st `elem` acSts = Right . reverse $ cur
+            | st `elem` acSts && null buf = Right . reverse $ cur
             | st == deadSt || null buf = Left . reverse $ cur
             | otherwise = let (c:cs) = buf
                               m = IM.findWithDefault M.empty st tran
