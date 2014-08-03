@@ -2,7 +2,7 @@ TurtleRegex
 ===========
 
 Toy regex engine in haskell.    
-Support `|`, `*`, `+`, `?`, `.`, `\d`, `\s`, `(...)`, `{x,y}`.
+Support `|`, `*`, `+`, `?`, `.`, `\d`, `\s`, `(...)`, `{x,y}`, `[a-z]`, `[^...]`.
 
 #### Usage
 
