@@ -16,9 +16,9 @@ Test in REPL:
 $ cabal repl
 ......
 Ok, modules loaded: TurtleRegex.
-λ> let p = compile "a?b{3,5}c"
-λ> match p "abbc"
-Left "abb"
-λ> match p "abbbbc"
-Right "abbbbc"
+λ> let p = compile "http://[a-zA-Z0-9\\-\\.]+\\.[a-zA-Z]{2,3}(/[^\\s]*)?"
+λ> match p "http://www.twitter.com/scturtle"
+Right "http://www.twitter.com/scturtle"
+> match p "https://www.twitter.com/"
+Left "http"
 ```

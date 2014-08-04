@@ -14,15 +14,11 @@ import Text.Parsec
 import Text.Parsec.Expr
 import Text.Parsec.String (Parser)
 
-data Literal = OneOf String
-             | Epsion
-             deriving (Show, Eq, Ord)
-
 litAnyChar = '\t': map chr [32 .. 126]
 litAnyDigit = "0123456789"
 litAnySpace = "\t "
 
-data Expr = Lit Literal
+data Expr = Literal String
           | Alter [Expr]
           | Concat [Expr]
           | Repeat (Int, Maybe Int) Expr
@@ -33,25 +29,26 @@ charSpec = (char '.' *> return litAnyChar)
        <|> do char '\\'
               c <- anyChar
               return . fromMaybe [c] $ lookup c escLst
-       <|> do c <- oneOf (litAnyChar \\ "]")
+       <|> do c <- oneOf (litAnyChar \\ "()[]")
               return [c]
     where escLst =  [('t', "\t"), ('d', litAnyDigit), ('s', litAnySpace)]
 
 singleOrRange :: Parser String
 singleOrRange = do
         c0 <- charSpec
-        ((do char '-'
-             c1 <- charSpec
-             case (c0, c1) of
-                 ([c0'], [c1']) -> return (enumFromTo c0' c1')
-                 _ -> error "range")
-         <|> return c0)
+        (do char '-'
+            c1 <- charSpec
+            case (c0, c1) of
+                ([c0'], [c1']) -> return (enumFromTo c0' c1')
+                _ -> error "range")
+           <|> return c0
 
-literal :: Parser Literal
-literal = between (char '(') (char ')')
-             (char '^' *> (OneOf . (litAnyChar \\) . concat <$> many1 singleOrRange)
-                      <|> (OneOf . concat <$> many1 singleOrRange))
-      <|> OneOf <$> charSpec
+lit :: Parser String
+lit = between (char '[') (char ']')
+             (char '^' *> ((litAnyChar \\) . concat' <$> many1 singleOrRange)
+                      <|> (concat' <$> many1 singleOrRange))
+      <|> charSpec
+    where concat' = S.toList . S.fromList . concat
 
 integer :: Parser Int
 integer = read <$> many1 digit
@@ -74,7 +71,7 @@ expr = buildExpressionParser ops atom where
           ,[Infix (return sequence) AssocRight]
           ,[Infix (choice <$ char '|') AssocRight]
           ]
-    atom = msum [Lit <$> literal, between (char '(') (char ')') expr]
+    atom = msum [Literal <$> lit, between (char '(') (char ')') expr]
     sequence a b = Concat $ seqTerms a ++ seqTerms b
     choice a b = Alter $ choiceTerms a ++ choiceTerms b
     seqTerms (Concat ts) = ts
@@ -89,8 +86,13 @@ parseReg s = case parse (expr <* eof) "regex" s of
 
 ---------------------------------------------------------------------------------
 
+data Edge = OneOf String
+          | Range (Char, Char)
+          | Epsion
+          deriving (Show, Eq, Ord)
+
 data Nfa = Nfa { maxId :: Int , startNfa :: Int , finalNfa :: Int
-               , tranNfa :: [(Int, (Literal, Int))] }
+               , tranNfa :: [(Int, (Edge, Int))] }
         deriving Show
 
 reg2nfa :: Expr -> Nfa
@@ -99,7 +101,7 @@ reg2nfa e = let nfa = tranReg e (1, 0)
 
 -- NOTE: (st :: Int, ed :: Int) means (next start id, final id)
 tranReg :: Expr -> (Int, Int) -> Nfa
-tranReg (Lit lit) (st, ed) = Nfa st st ed [(st, (lit, ed))]
+tranReg (Literal lit) (st, ed) = Nfa st st ed [(st, (OneOf lit, ed))]
 
 tranReg (Alter es) (st, ed) =
         let travel e (nfas, st, ed) = let nfa = tranReg e (st, ed)
@@ -140,12 +142,21 @@ tranReg (Repeat (a, b) e) (st, ed) =
                                     replicate (b-a) (Repeat (0, Just 1) e)
         in  tranReg (Concat es) (st, ed)
 
--- split char ranges to not be overloapped with each other
+toRange :: String -> [(Char, Char)]
+toRange [] = []
+toRange (x:xs) = reverse [(last s, head s) | s <- toRange' x xs [[x]]]
+    where toRange' _ [] res = res
+          toRange' pre (x:xs) res@(r:rs) =
+                let newres = if succ pre == x then (x:r):rs else [x]:res
+                in  toRange' x xs newres
+
 swapSplit :: [String] -> M.Map String [String]
 swapSplit segs = M.fromList [(seg, swapSplit' seg) | seg <- segs]
-    where sts = nub $ map head segs
-          eds = nub $ map last segs
-          swapSplit' seg = filter (not . null) . reverse . map reverse
+    where ranges = concatMap toRange segs
+          sts = nub $ map fst ranges
+          eds = nub $ map snd ranges
+          swapSplit' seg = filter (not . null) 
+                         . reverse . map reverse
                          $ foldl swapSplit'' [[]] seg
           swapSplit'' res@(x:xs) c
             | c `elem` sts && c `elem` eds = []:[c]:res
@@ -153,20 +164,19 @@ swapSplit segs = M.fromList [(seg, swapSplit' seg) | seg <- segs]
             | c `elem` eds = []:(c:x):xs
             | otherwise = (c:x):xs
 
--- split all rules
-renameTran :: [(Int, (Literal, Int))] -> [(Int, (Literal, Int))]
+renameTran :: [(Int, (Edge, Int))] -> [(Int, (Edge, Int))]
 renameTran tran = concatMap renameOne tran
     where m = swapSplit . nub $ [cs | (_, (OneOf cs, _)) <- tran]
-          more Epsion = [Epsion]
-          more (OneOf cs) = map OneOf $ m M.! cs
-          renameOne (a, (b, c)) = [(a, (b', c)) | b' <- more b]
+          renameOne rule@(_, (Epsion, _)) = [rule]
+          renameOne (a, (OneOf s, c)) = [ (a, (Range (head s', last s'), c))
+                                        | s' <- m M.! s ]
 
 {-----------------------------------------------------------------------------------}
 
 data DfaBig = DfaBig IS.IntSet   -- start status
                      [IS.IntSet] -- accepted statuses
                      [IS.IntSet] -- all statuses
-                     (M.Map IS.IntSet [(Literal, IS.IntSet)])
+                     (M.Map IS.IntSet [(Edge, IS.IntSet)])
             deriving Show
 
 -- all reachable status following epsion
@@ -220,7 +230,7 @@ nfa2dfa nfa = let startSt = reach' $ startNfa nfa -- closure of start status
 data Dfa = Dfa Int -- startSt
                Int -- deadSt
                [Int] -- acceptedSts
-               (IM.IntMap [(Literal, Int)]) -- transition
+               (IM.IntMap [(Edge, Int)]) -- transition
             deriving Show
 
 dead = IS.empty -- dead status, self circled
@@ -273,9 +283,9 @@ splitOne tran subset =
 
 ---------------------------------------------------------------------------------
 
-matchLit :: Char -> Literal -> Bool
-matchLit c (OneOf cs) = c `elem` cs
-matchLit _ Epsion = error "Epsion edges in Dfa are not allowed."
+matchLit :: Char -> Edge -> Bool
+matchLit c (Range (h, t)) = h <= c && c <= t
+matchLit _ _ = error "Oh no."
 
 match :: Dfa -> String -> Either String String
 match (Dfa stSt deadSt acSts tran) s = match' stSt s ""
