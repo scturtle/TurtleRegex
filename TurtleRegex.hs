@@ -1,4 +1,4 @@
-module TurtleRegex (parseReg, reg2nfa, nfa2dfa, minimize, compile, match) where
+module TurtleRegex (compile, match) where
 
 import Data.List
 import Data.Maybe
@@ -9,8 +9,9 @@ import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Data.IntMap as IM
 import qualified Data.IntSet as IS
-import Text.ParserCombinators.Parsec
-import Text.ParserCombinators.Parsec.Expr
+import Text.Parsec
+import Text.Parsec.Expr
+import Text.Parsec.String (Parser)
 
 data CharSpec = C Char | AnyChar | AnyDigit | AnySpace
              deriving (Show, Eq, Ord)
@@ -31,9 +32,7 @@ spec :: Parser CharSpec
 spec = (char '.' *> return AnyChar)
    <|> do char '\\'
           c <- anyChar
-          case lookup c escLst of
-              Just c' -> return c'
-              Nothing -> return $ C c
+          return . fromMaybe (C c) $ lookup c escLst
     where escLst =  [('t', C '\t'), ('d', AnyDigit), ('s', AnySpace)]
 
 charSpec :: Parser CharSpec
@@ -61,7 +60,7 @@ range = do char '{'
             (do a <- integer
                 char ','
                 (do b <- integer; char '}'; return (a, Just b)) <|>
-                 (do char '}'; return (a, Nothing))) -- NOTE: -1 for INF
+                 (do char '}'; return (a, Nothing))) -- NOTE: Nothing for INF
 
 expr :: Parser Expr
 expr = buildExpressionParser ops atom where
@@ -101,8 +100,8 @@ tranReg (Lit lit) (st, ed) = Nfa st st ed [(st, (lit, ed))]
 
 tranReg (Alter es) (st, ed) =
         let travel e (nfas, st, ed) = let nfa = tranReg e (st, ed)
-                                      in  (nfa: nfas, 1 + maxId nfa, ed)
-            (nfas, newSt, _) = foldr travel ([], st, ed) es
+                                      in  (nfa: nfas, 1 + maxId nfa, ed) -- same ed
+            (nfas, newSt, _) = foldr travel ([], st, ed) es -- new st
             newEdges = [(newSt, (Epsion, startNfa nfa)) | nfa <- nfas]
         in  Nfa newSt newSt ed (newEdges ++ concatMap tranNfa nfas)
 
@@ -110,7 +109,7 @@ tranReg (Concat [e]) (st, ed) = tranReg e (st, ed)
 tranReg (Concat es) (st, ed) =
         let travel e (nfas, st, ed) = let nfa = tranReg e (st, ed)
                                       in  (nfa: nfas, 1 + maxId nfa, startNfa nfa)
-            (nfas, maxid_1, _) = foldr travel ([], st, ed) es
+            (nfas, maxid_1, _) = foldr travel ([], st, ed) es -- chain
         in  Nfa (maxid_1 - 1) (startNfa . head $ nfas) ed (concatMap tranNfa nfas)
 
 tranReg (Repeat (0, Nothing) e) (st, ed) =
@@ -143,9 +142,10 @@ tranReg (Repeat (a, b) e) (st, ed) =
 data DfaBig = DfaBig IS.IntSet   -- start status
                      [IS.IntSet] -- accepted statuses
                      [IS.IntSet] -- all statuses
-                     [(IS.IntSet, M.Map Literal IS.IntSet)]
+                     (M.Map IS.IntSet [(Literal, IS.IntSet)])
             deriving Show
 
+-- all reachable status following epsion
 reach :: Nfa -> Int -> IS.IntSet
 reach nfa s = IS.fromList . snd $ dfs s (IS.empty, [])
         where dfs s (saw, ans) =
@@ -153,60 +153,69 @@ reach nfa s = IS.fromList . snd $ dfs s (IS.empty, [])
                     ans' = s: ans
                     test (a, (b, c)) = if a == s && b == Epsion then Just c
                                                                 else Nothing
-                    ts = mapMaybe test . tranNfa $ nfa
+                    ts = mapMaybe test . tranNfa $ nfa -- reachable t's from s
                 in  if IS.member s saw
                         then (saw, ans)
                         else foldr dfs (saw', ans') ts
 
 nfa2dfa :: Nfa -> DfaBig
-nfa2dfa nfa = let startSt = reach' $ startNfa nfa
-                  (saw, edges) = construct startSt (S.empty, [])
+nfa2dfa nfa = let startSt = reach' $ startNfa nfa -- closure of start status
+                  (saw, edges) = construct startSt (S.empty, []) -- dfs
                   allSts = S.toList saw
                   acceptedSts = filter (IS.member (finalNfa nfa)) allSts
-                  -- mapping edges
+                  -- grouping and mapping edges
                   m = groupBy ((==) `on` fst) . sortBy (compare `on` fst) $ edges
-                  m' = [(fst . head $ g, M.fromList . map snd $ g) | g <- m]
+                  m' = M.fromList [(fst . head $ g, map snd g) | g <- m]
 
               in  DfaBig startSt acceptedSts allSts m'
 
-    where reach_map = M.fromList [(i, reach nfa i) | i <- [0 .. maxId nfa]]
-          reach' x = reach_map M.! x
-          extends xs = IS.unions [reach' x | x <- xs]
+    where -- cached closure of all status
+          reach_map = M.fromList [(i, reach nfa i) | i <- [0 .. maxId nfa]]
+          reach' x = reach_map M.! x -- helper function
+          extends xs = IS.unions [reach' x | x <- xs] -- unioned closure
+          -- dfs to construct all dfa's status and edges
           construct s (saw, edges) =
             if S.member s saw
                 then (saw, edges)
-                else let es = [ (b, c) | (a, (b, c)) <- tranNfa nfa
+                else let -- all outer edges
+                         es = [ (b, c) | (a, (b, c)) <- tranNfa nfa
                                        , IS.member a s ]
+                         -- grouping by b
                          gs = groupBy ((==) `on` fst) .
                               sortBy (compare `on` fst) $ es
-                         tr = [ (e , extends . map snd $ g)
-                              | g <- gs, let e = fst . head $ g, e /= Epsion]
+                         -- (b, t: all reachable status following b)
+                         tr = [ (b , extends . map snd $ g)
+                              | g <- gs, let b = fst . head $ g, b /= Epsion]
                          saw' = S.insert s saw
-                         edges' = edges ++ [(s, (e, t)) | (e, t) <- tr]
+                         -- edges: s--b->t
+                         edges' = edges ++ [(s, (b, t)) | (b, t) <- tr]
                      in  foldr construct (saw', edges') (map snd tr)
 
 ---------------------------------------------------------------------------------
 
-data Dfa = Dfa { startSt :: Int
-               , deadSt :: Int
-               , acceptedSts :: [Int]
-               , transition :: IM.IntMap (M.Map Literal Int) }
+data Dfa = Dfa Int -- startSt 
+               Int -- deadSt 
+               [Int] -- acceptedSts 
+               (IM.IntMap [(Literal, Int)]) -- transition
             deriving Show
 
-dead = IS.empty
+dead = IS.empty -- dead status, self circled
 
 minimize :: DfaBig -> Dfa
 minimize (DfaBig stSt acSts allSts tran) =
-        let subsets = [ S.fromList acSts,
-                        S.difference (S.fromList (dead : allSts)) -- dead status
+        let -- two subsets: accepted, not
+            subsets = [ S.fromList acSts,
+                        S.difference (S.fromList (dead : allSts))
                                      (S.fromList  acSts)]
+            -- all minimize (maximize ?) subsets by hopcroft algorithm
             status_sets = hopcroft tran subsets
+            -- new id mapping: status of each subsets -> Int
             newid = M.fromList [ (status, i)
                                | (i, subset) <- zip [0..] status_sets
                                , status <- S.toList subset]
-            tran' = [ (newid M.! a, m') | (a, m) <- tran
-                    , let m' = M.fromList [ (b, newid M.! c)
-                                          | (b, c) <- M.toList m] ]
+            -- new ids in transition
+            tran' = [ (newid M.! a, m') | (a, m) <- M.toList tran
+                    , let m' = [ (b, newid M.! c) | (b, c) <- m] ]
             tran'' = IM.fromList tran'
         in  Dfa (newid M.! stSt)
                 (newid M.! dead)
@@ -215,24 +224,23 @@ minimize (DfaBig stSt acSts allSts tran) =
 
 -- hopcroft :: transition -> subsets -> new subsets
 hopcroft tran subsets =
-        let subsets' = splitAll tran subsets
-        in  if length subsets == length subsets'
+        let subsets' = concatMap (splitOne tran) subsets
+        in  if length subsets == length subsets' -- stable ?
                 then subsets'
                 else hopcroft tran subsets'
 
-splitAll tran = concatMap (splitOne tran)
-
 -- splitOne :: transition -> subset -> new subsets
 splitOne tran subset =
-  if S.size subset == 1
+  if S.size subset == 1 -- cannot split
       then [subset]
-      else let tran' = [(a, m) | (a, m) <- tran, S.member a subset]
-               bs = nub . concatMap (M.keys . snd) $ tran'
-               tran'' = M.fromList tran'
-               sp b = let self_as =
+      else let -- all outer edges
+               bs = nub . concat $ [ map fst m | a <- S.toList subset
+                                   , let m = M.findWithDefault [] a tran]
+              -- whether can split by edge b
+               sp b = let self_as = -- a's that back to self subsets
                             S.fromList [a | a <- S.toList subset
-                                       , let m = M.findWithDefault M.empty a tran''
-                                       , let c = M.findWithDefault dead b m
+                                       , let m = M.findWithDefault [] a tran
+                                       , let c = fromMaybe dead (lookup b m)
                                        , S.member c subset]
                       in  if S.size self_as `elem` [0, S.size subset]
                               then Nothing
@@ -251,24 +259,24 @@ matchChar c cs = case cs of
 matchRange :: Char -> (CharSpec, CharSpec) -> Bool
 matchRange c r = case r of
                      (C c0, C c1) -> c0 <= c && c <= c1
-                     (x, _) -> matchChar c x
+                     (x, _) -> matchChar c x -- NOTE: spec
 
 matchLit :: Char -> Literal -> Bool
 matchLit c (One c') = matchChar c c'
 matchLit c (OneOf rgs) = any (matchRange c) rgs
 matchLit c (NoneOf rgs) = not $ any (matchRange c) rgs
+matchLit _ Epsion = error "Epsion edges in Dfa are not allowed."
 
 match :: Dfa -> String -> Either String String
 match (Dfa stSt deadSt acSts tran) s = match' stSt s ""
     where match' st buf cur
             | st `elem` acSts && null buf = Right . reverse $ cur
             | st == deadSt || null buf = Left . reverse $ cur
-            | otherwise = let (c:cs) = buf
-                              m = IM.findWithDefault M.empty st tran
-                              bcs = [ nst | (l, nst) <- M.toList m, matchLit c l ]
-                              nst = if null bcs then deadSt else head bcs
-                              cur' = if null bcs then cur else c : cur
-                          in  match' nst cs cur'
+            | otherwise = let (c:buf') = buf
+                              m = IM.findWithDefault [] st tran
+                              nxts = [ nxt | (l, nxt) <- m, matchLit c l ]
+                          in  if null nxts then match' deadSt      buf' cur
+                                           else match' (head nxts) buf' (c:cur)
 
 compile :: String -> Dfa
 compile = minimize . nfa2dfa . reg2nfa . parseReg
