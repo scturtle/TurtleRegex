@@ -1,7 +1,8 @@
-module TurtleRegex (compile, match) where
+module TurtleRegex where
 
 import Data.List
 import Data.Maybe
+import Data.Char (chr)
 import Data.Function (on)
 import Control.Applicative ((<*), (<$>), (*>), (<$))
 import Control.Monad
@@ -13,14 +14,13 @@ import Text.Parsec
 import Text.Parsec.Expr
 import Text.Parsec.String (Parser)
 
-data CharSpec = C Char | AnyChar | AnyDigit | AnySpace
-             deriving (Show, Eq, Ord)
-
-data Literal = NoneOf [(CharSpec, CharSpec)]
-             | OneOf [(CharSpec, CharSpec)]
-             | One CharSpec
+data Literal = OneOf String
              | Epsion
              deriving (Show, Eq, Ord)
+
+litAnyChar = '\t': map chr [32 .. 126]
+litAnyDigit = "0123456789"
+litAnySpace = "\t "
 
 data Expr = Lit Literal
           | Alter [Expr]
@@ -28,28 +28,30 @@ data Expr = Lit Literal
           | Repeat (Int, Maybe Int) Expr
           deriving Show
 
-spec :: Parser CharSpec
-spec = (char '.' *> return AnyChar)
-   <|> do char '\\'
-          c <- anyChar
-          return . fromMaybe (C c) $ lookup c escLst
-    where escLst =  [('t', C '\t'), ('d', AnyDigit), ('s', AnySpace)]
+charSpec :: Parser String
+charSpec = (char '.' *> return litAnyChar)
+       <|> do char '\\'
+              c <- anyChar
+              return . fromMaybe [c] $ lookup c escLst
+       <|> do c <- oneOf (litAnyChar \\ "]")
+              return [c]
+    where escLst =  [('t', "\t"), ('d', litAnyDigit), ('s', litAnySpace)]
 
-charSpec :: Parser CharSpec
-charSpec = spec <|> (C <$> (alphaNum <|> space))
-
-singleOrRange :: Parser (CharSpec, CharSpec)
+singleOrRange :: Parser String
 singleOrRange = do
         c0 <- charSpec
-        (do char '-'; c1 <- charSpec; return (c0, c1)) <|> return (c0, c0)
+        ((do char '-'
+             c1 <- charSpec
+             case (c0, c1) of
+                 ([c0'], [c1']) -> return (enumFromTo c0' c1')
+                 _ -> error "range")
+         <|> return c0)
 
 literal :: Parser Literal
-literal = do char '['
-             l <- (char '^' *> (NoneOf <$> many1 singleOrRange))
-                   <|> (OneOf <$> many1 singleOrRange)
-             char ']'
-             return l
-      <|> One <$> charSpec
+literal = between (char '(') (char ')')
+             (char '^' *> (OneOf . (litAnyChar \\) . concat <$> many1 singleOrRange)
+                      <|> (OneOf . concat <$> many1 singleOrRange))
+      <|> OneOf <$> charSpec
 
 integer :: Parser Int
 integer = read <$> many1 digit
@@ -92,7 +94,8 @@ data Nfa = Nfa { maxId :: Int , startNfa :: Int , finalNfa :: Int
         deriving Show
 
 reg2nfa :: Expr -> Nfa
-reg2nfa e = tranReg e (1, 0)
+reg2nfa e = let nfa = tranReg e (1, 0)
+            in  nfa { tranNfa = renameTran $ tranNfa nfa }
 
 -- NOTE: (st :: Int, ed :: Int) means (next start id, final id)
 tranReg :: Expr -> (Int, Int) -> Nfa
@@ -137,7 +140,28 @@ tranReg (Repeat (a, b) e) (st, ed) =
                                     replicate (b-a) (Repeat (0, Just 1) e)
         in  tranReg (Concat es) (st, ed)
 
----------------------------------------------------------------------------------
+-- split char ranges to not be overloapped with each other
+swapSplit :: [String] -> M.Map String [String]
+swapSplit segs = M.fromList [(seg, swapSplit' seg) | seg <- segs]
+    where sts = nub $ map head segs
+          eds = nub $ map last segs
+          swapSplit' seg = filter (not . null) . reverse . map reverse
+                         $ foldl swapSplit'' [[]] seg
+          swapSplit'' res@(x:xs) c
+            | c `elem` sts && c `elem` eds = []:[c]:res
+            | c `elem` sts = [c]:res
+            | c `elem` eds = []:(c:x):xs
+            | otherwise = (c:x):xs
+
+-- split all rules
+renameTran :: [(Int, (Literal, Int))] -> [(Int, (Literal, Int))]
+renameTran tran = concatMap renameOne tran
+    where m = swapSplit . nub $ [cs | (_, (OneOf cs, _)) <- tran]
+          more Epsion = [Epsion]
+          more (OneOf cs) = map OneOf $ m M.! cs
+          renameOne (a, (b, c)) = [(a, (b', c)) | b' <- more b]
+
+{-----------------------------------------------------------------------------------}
 
 data DfaBig = DfaBig IS.IntSet   -- start status
                      [IS.IntSet] -- accepted statuses
@@ -193,9 +217,9 @@ nfa2dfa nfa = let startSt = reach' $ startNfa nfa -- closure of start status
 
 ---------------------------------------------------------------------------------
 
-data Dfa = Dfa Int -- startSt 
-               Int -- deadSt 
-               [Int] -- acceptedSts 
+data Dfa = Dfa Int -- startSt
+               Int -- deadSt
+               [Int] -- acceptedSts
                (IM.IntMap [(Literal, Int)]) -- transition
             deriving Show
 
@@ -249,22 +273,8 @@ splitOne tran subset =
 
 ---------------------------------------------------------------------------------
 
-matchChar :: Char -> CharSpec -> Bool
-matchChar c cs = case cs of
-                     (C c') -> c == c'
-                     AnyDigit -> c `elem` ['0' .. '9']
-                     AnySpace -> c `elem` " \t"
-                     AnyChar -> True
-
-matchRange :: Char -> (CharSpec, CharSpec) -> Bool
-matchRange c r = case r of
-                     (C c0, C c1) -> c0 <= c && c <= c1
-                     (x, _) -> matchChar c x -- NOTE: spec
-
 matchLit :: Char -> Literal -> Bool
-matchLit c (One c') = matchChar c c'
-matchLit c (OneOf rgs) = any (matchRange c) rgs
-matchLit c (NoneOf rgs) = not $ any (matchRange c) rgs
+matchLit c (OneOf cs) = c `elem` cs
 matchLit _ Epsion = error "Epsion edges in Dfa are not allowed."
 
 match :: Dfa -> String -> Either String String
